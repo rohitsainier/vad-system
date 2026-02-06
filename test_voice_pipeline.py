@@ -33,7 +33,7 @@ def main():
     # Configure pipeline
     config = PipelineConfig(
         whisper_model="base",      # Use 'small' or 'medium' for better accuracy
-        llm_model="llama3.1:8b",   # Change to your model
+        llm_model="gemma3:4b",   # Change to your model
         tts_engine="espeak",       # Use espeak since we're in WSL2
         whisper_language="en"
     )
