@@ -1,0 +1,261 @@
+# .gitignore
+# Production-ready .gitignore for VAD System
+
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Cython
+cython_debug/
+
+# ============================================================
+# Virtual Environments
+# ============================================================
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Conda
+*.conda
+conda-meta/
+
+# ============================================================
+# IDE / Editors
+# ============================================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Spyder
+.spyderproject
+.spyproject
+
+# ============================================================
+# Testing
+# ============================================================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytest-report.html
+
+# ============================================================
+# PyTorch / ML Models
+# ============================================================
+# Torch Hub cache (downloaded models)
+.cache/
+torch_hub/
+hub/
+
+# Model files (large binary files)
+*.pt
+*.pth
+*.onnx
+*.bin
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+
+# ONNX Runtime
+*.ort
+
+# ============================================================
+# Audio Files (test artifacts)
+# ============================================================
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.wma
+*.aiff
+*.raw
+*.pcm
+
+# Exception: keep example/test audio if explicitly tracked
+# !examples/sample_audio/*.wav
+
+# Speech segments output
+speech_segments/
+output_segments/
+test_output/
+
+# ============================================================
+# Test Data (downloaded datasets)
+# ============================================================
+test_data/
+vad_test_data/
+LibriSpeech/
+data/
+
+# Generated test files
+test_speech.wav
+test.wav
+test_audio.wav
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/
+log/
+*.log.*
+
+# ============================================================
+# Docker
+# ============================================================
+.docker/
+docker-data/
+
+# ============================================================
+# OS Files
+# ============================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================================
+# Environment / Secrets
+# ============================================================
+.env
+.env.*
+!.env.example
+config.env
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# ============================================================
+# Monitoring / Metrics
+# ============================================================
+# Prometheus data
+prometheus_data/
+grafana_data/
+
+# ============================================================
+# Build artifacts
+# ============================================================
+*.o
+*.a
+*.dylib
+*.dll
+
+# ============================================================
+# Temporary files
+# ============================================================
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.orig
+
+# ============================================================
+# Documentation build
+# ============================================================
+docs/_build/
+site/
+
+# ============================================================
+# Misc
+# ============================================================
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ruff
+.ruff_cache/
+
+# profiling
+*.prof
+*.lprof
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Coverage
+.coverage
+.coverage.*
