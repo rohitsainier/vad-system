@@ -34,7 +34,7 @@ class PipelineConfig:
     whisper_language: Optional[str] = "en"
     
     # LLM
-    llm_model: str = "llama3.1:8b"
+    llm_model: str = "translategemma"
     llm_temperature: float = 0.7
     llm_max_tokens: int = 256
     system_prompt: Optional[str] = None

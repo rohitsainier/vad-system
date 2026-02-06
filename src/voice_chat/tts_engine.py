@@ -1,18 +1,15 @@
-# src/voice_chat/tts_engine.py
 """
-Text-to-Speech Engine
-Supports Piper TTS (offline) and edge-tts (online fallback)
+TTS Engine - Text-to-Speech with multiple backends
 """
 import numpy as np
-import io
-import time
-import tempfile
-import os
 import subprocess
-import shutil
-from typing import Optional
+import tempfile
+import asyncio
+import wave
+import struct
+from pathlib import Path
+from typing import Optional, Tuple
 from dataclasses import dataclass
-import soundfile as sf
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -20,264 +17,311 @@ logger = structlog.get_logger(__name__)
 
 @dataclass
 class TTSResult:
-    """Result from text-to-speech"""
-    audio: np.ndarray
+    """Result from TTS synthesis"""
+    audio: np.ndarray  # float32 audio
     sample_rate: int
     duration_ms: float
-    processing_time_ms: float
-    engine: str
+    engine_used: str
 
 
 class TTSEngine:
     """
-    Text-to-Speech Engine
+    Text-to-Speech engine with multiple backends
     
-    Priority order:
-    1. Piper TTS (fast, offline, good quality)
-    2. edge-tts (Microsoft, needs internet, best quality)
-    3. espeak (offline, robotic but always works)
+    Backends:
+    - piper: Fast, local neural TTS
+    - edge-tts: Microsoft Edge TTS (online)
+    - espeak: Basic fallback
     """
+    
+    PIPER_SAMPLE_RATE = 22050  # Piper default output rate
     
     def __init__(
         self,
-        engine: str = "auto",  # "piper", "edge-tts", "espeak", "auto"
+        engine: str = "auto",
         piper_model: Optional[str] = None,
         edge_voice: str = "en-US-AriaNeural",
-        espeak_voice: str = "en",
-        output_sample_rate: int = 16000
+        espeak_voice: str = "en"
     ):
         self.preferred_engine = engine
         self.piper_model = piper_model
         self.edge_voice = edge_voice
         self.espeak_voice = espeak_voice
-        self.output_sample_rate = output_sample_rate
         
+        self._available_engines = []
         self._active_engine = None
-        self._piper = None
         self._is_initialized = False
     
     def initialize(self):
-        """Initialize TTS engine"""
+        """Initialize and detect available TTS engines"""
         if self._is_initialized:
             return
         
-        if self.preferred_engine == "auto":
-            self._active_engine = self._detect_best_engine()
-        else:
-            self._active_engine = self.preferred_engine
-        
-        # Initialize specific engine
-        if self._active_engine == "piper":
-            self._init_piper()
-        
-        self._is_initialized = True
-        logger.info("TTS Engine initialized", engine=self._active_engine)
-    
-    def _detect_best_engine(self) -> str:
-        """Detect the best available TTS engine"""
+        # Check available engines
+        self._available_engines = []
         
         # Check Piper
-        try:
-            import piper
-            if self.piper_model and os.path.exists(self.piper_model):
-                logger.info("Piper TTS available")
-                return "piper"
-        except ImportError:
-            pass
-        
-        # Check piper CLI
-        if shutil.which('piper'):
-            return "piper"
+        if self._check_piper():
+            self._available_engines.append("piper")
+            logger.info("Piper TTS available")
         
         # Check edge-tts
-        try:
-            import edge_tts
-            logger.info("edge-tts available")
-            return "edge-tts"
-        except ImportError:
-            pass
+        if self._check_edge_tts():
+            self._available_engines.append("edge-tts")
+            logger.info("Edge TTS available")
         
         # Check espeak
-        if shutil.which('espeak'):
-            logger.info("espeak available (fallback)")
-            return "espeak"
+        if self._check_espeak():
+            self._available_engines.append("espeak")
+            logger.info("eSpeak available")
         
-        raise RuntimeError(
-            "No TTS engine available. Install one:\n"
-            "  pip install piper-tts\n"
-            "  pip install edge-tts\n"
-            "  sudo apt-get install espeak"
-        )
+        if not self._available_engines:
+            raise RuntimeError("No TTS engines available! Install piper, edge-tts, or espeak.")
+        
+        # Select engine
+        if self.preferred_engine == "auto":
+            self._active_engine = self._available_engines[0]
+        elif self.preferred_engine in self._available_engines:
+            self._active_engine = self.preferred_engine
+        else:
+            logger.warning(f"{self.preferred_engine} not available, using {self._available_engines[0]}")
+            self._active_engine = self._available_engines[0]
+        
+        logger.info(f"Using TTS engine: {self._active_engine}")
+        self._is_initialized = True
     
-    def _init_piper(self):
-        """Initialize Piper TTS"""
-        if self.piper_model:
+    def _check_piper(self) -> bool:
+        """Check if Piper is available"""
+        try:
+            result = subprocess.run(
+                ["piper", "--help"],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+    
+    def _check_edge_tts(self) -> bool:
+        """Check if edge-tts is available"""
+        try:
+            import edge_tts
+            return True
+        except ImportError:
+            return False
+    
+    def _check_espeak(self) -> bool:
+        """Check if espeak is available"""
+        try:
+            result = subprocess.run(
+                ["espeak", "--version"],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # Try espeak-ng
             try:
-                from piper import PiperVoice
-                self._piper = PiperVoice.load(self.piper_model)
-                logger.info("Piper voice loaded", model=self.piper_model)
-            except Exception as e:
-                logger.warning("Piper model load failed, using CLI", error=str(e))
+                result = subprocess.run(
+                    ["espeak-ng", "--version"],
+                    capture_output=True,
+                    timeout=5
+                )
+                return result.returncode == 0
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return False
     
     def synthesize(self, text: str) -> TTSResult:
         """
-        Convert text to speech
+        Synthesize text to speech
         
         Args:
             text: Text to speak
             
         Returns:
-            TTSResult with audio data
+            TTSResult with audio
         """
         if not self._is_initialized:
             self.initialize()
         
-        start_time = time.time()
-        
-        # Clean text for TTS
-        text = self._clean_text(text)
-        
         if not text.strip():
+            # Return silence for empty text
             return TTSResult(
                 audio=np.zeros(1600, dtype=np.float32),
-                sample_rate=self.output_sample_rate,
+                sample_rate=16000,
                 duration_ms=100,
-                processing_time_ms=0,
-                engine=self._active_engine
+                engine_used="none"
             )
         
-        # Route to active engine
-        if self._active_engine == "piper":
-            audio, sr = self._synthesize_piper(text)
-        elif self._active_engine == "edge-tts":
-            audio, sr = self._synthesize_edge_tts(text)
-        elif self._active_engine == "espeak":
-            audio, sr = self._synthesize_espeak(text)
-        else:
-            raise RuntimeError(f"Unknown TTS engine: {self._active_engine}")
+        # Try active engine, fall back if needed
+        engines_to_try = [self._active_engine] + [
+            e for e in self._available_engines if e != self._active_engine
+        ]
         
-        # Resample if needed
-        if sr != self.output_sample_rate:
-            from scipy.signal import resample
-            new_length = int(len(audio) * self.output_sample_rate / sr)
-            audio = resample(audio, new_length).astype(np.float32)
-            sr = self.output_sample_rate
+        for engine in engines_to_try:
+            try:
+                if engine == "piper":
+                    audio, sr = self._synthesize_piper(text)
+                elif engine == "edge-tts":
+                    audio, sr = self._synthesize_edge_tts(text)
+                elif engine == "espeak":
+                    audio, sr = self._synthesize_espeak(text)
+                else:
+                    continue
+                
+                duration_ms = len(audio) / sr * 1000
+                
+                return TTSResult(
+                    audio=audio,
+                    sample_rate=sr,
+                    duration_ms=duration_ms,
+                    engine_used=engine
+                )
+                
+            except Exception as e:
+                logger.warning(f"{engine} failed: {e}, trying next...")
+                continue
         
-        duration_ms = len(audio) / sr * 1000
-        processing_time = (time.time() - start_time) * 1000
-        
-        result = TTSResult(
-            audio=audio,
-            sample_rate=sr,
-            duration_ms=duration_ms,
-            processing_time_ms=processing_time,
-            engine=self._active_engine
-        )
-        
-        logger.info(
-            "TTS complete",
-            engine=self._active_engine,
-            text_len=len(text),
-            duration_ms=duration_ms,
-            processing_ms=processing_time
-        )
-        
-        return result
+        raise RuntimeError("All TTS engines failed")
     
-    def _synthesize_piper(self, text: str):
+    def _synthesize_piper(self, text: str) -> Tuple[np.ndarray, int]:
         """Synthesize using Piper TTS"""
-        if self._piper:
-            # Use Python API
-            audio_bytes = io.BytesIO()
-            self._piper.synthesize(text, audio_bytes)
-            audio_bytes.seek(0)
-            audio, sr = sf.read(audio_bytes)
-            return audio.astype(np.float32), sr
         
-        # Use CLI
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-            temp_path = f.name
+        # Piper outputs raw 16-bit PCM audio to stdout
+        cmd = ["piper", "--output_raw"]
         
-        try:
-            cmd = f'echo "{text}" | piper --output_file {temp_path}'
-            if self.piper_model:
-                cmd += f' --model {self.piper_model}'
-            
-            subprocess.run(cmd, shell=True, capture_output=True, timeout=30)
-            audio, sr = sf.read(temp_path)
-            return audio.astype(np.float32), sr
-        finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+        if self.piper_model:
+            cmd.extend(["--model", self.piper_model])
+        
+        # Run piper with text input
+        process = subprocess.run(
+            cmd,
+            input=text.encode('utf-8'),
+            capture_output=True,
+            timeout=30
+        )
+        
+        if process.returncode != 0:
+            stderr = process.stderr.decode('utf-8', errors='ignore')
+            raise RuntimeError(f"Piper failed: {stderr}")
+        
+        # Raw output is 16-bit signed PCM at 22050 Hz (Piper default)
+        raw_audio = process.stdout
+        
+        if len(raw_audio) < 2:
+            raise RuntimeError("Piper returned empty audio")
+        
+        # Convert raw bytes to numpy array
+        # Piper outputs 16-bit signed little-endian PCM
+        audio_int16 = np.frombuffer(raw_audio, dtype=np.int16)
+        
+        # Convert to float32 normalized [-1, 1]
+        audio = audio_int16.astype(np.float32) / 32768.0
+        
+        return audio, self.PIPER_SAMPLE_RATE
     
-    def _synthesize_edge_tts(self, text: str):
-        """Synthesize using edge-tts (Microsoft)"""
-        import asyncio
+    def _synthesize_edge_tts(self, text: str) -> Tuple[np.ndarray, int]:
+        """Synthesize using Edge TTS"""
         import edge_tts
+        import io
         
+        # Run async edge-tts
         async def _generate():
             communicate = edge_tts.Communicate(text, self.edge_voice)
+            audio_data = b""
             
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
-                temp_path = f.name
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_data += chunk["data"]
             
-            try:
-                await communicate.save(temp_path)
-                audio, sr = sf.read(temp_path)
-                return audio.astype(np.float32), sr
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
+            return audio_data
         
-        # Run async in sync context
+        # Run in event loop
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(asyncio.run, _generate())
-                    return future.result(timeout=30)
-            else:
-                return asyncio.run(_generate())
         except RuntimeError:
-            return asyncio.run(_generate())
-    
-    def _synthesize_espeak(self, text: str):
-        """Synthesize using espeak"""
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-            temp_path = f.name
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        mp3_data = loop.run_until_complete(_generate())
+        
+        # Convert MP3 to WAV using ffmpeg
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as mp3_file:
+            mp3_file.write(mp3_data)
+            mp3_path = mp3_file.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as wav_file:
+            wav_path = wav_file.name
         
         try:
-            subprocess.run(
-                ['espeak', '-w', temp_path, '-s', '150', '-v', self.espeak_voice, text],
-                capture_output=True,
-                timeout=15
-            )
-            audio, sr = sf.read(temp_path)
-            return audio.astype(np.float32), sr
+            # Convert MP3 to WAV
+            subprocess.run([
+                "ffmpeg", "-y", "-i", mp3_path,
+                "-ar", "22050", "-ac", "1", "-f", "wav",
+                wav_path
+            ], capture_output=True, timeout=30, check=True)
+            
+            # Read WAV file
+            import soundfile as sf
+            audio, sr = sf.read(wav_path)
+            audio = audio.astype(np.float32)
+            
+            return audio, sr
+            
         finally:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+            # Cleanup temp files
+            import os
+            try:
+                os.unlink(mp3_path)
+                os.unlink(wav_path)
+            except:
+                pass
     
-    def _clean_text(self, text: str) -> str:
-        """Clean text for TTS"""
-        import re
+    def _synthesize_espeak(self, text: str) -> Tuple[np.ndarray, int]:
+        """Synthesize using espeak/espeak-ng"""
         
-        # Remove markdown
-        text = re.sub(r'\*+', '', text)
-        text = re.sub(r'#+\s*', '', text)
-        text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
-        text = re.sub(r'`[^`]*`', '', text)
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            wav_path = f.name
         
-        # Remove special characters
-        text = re.sub(r'[{}\[\]|\\<>]', '', text)
-        
-        # Clean whitespace
-        text = re.sub(r'\s+', ' ', text).strip()
-        
-        return text
+        try:
+            # Try espeak-ng first, then espeak
+            for cmd in ["espeak-ng", "espeak"]:
+                try:
+                    result = subprocess.run([
+                        cmd, "-v", self.espeak_voice,
+                        "-w", wav_path,
+                        text
+                    ], capture_output=True, timeout=30)
+                    
+                    if result.returncode == 0:
+                        break
+                except FileNotFoundError:
+                    continue
+            else:
+                raise RuntimeError("espeak not found")
+            
+            # Read WAV file
+            import soundfile as sf
+            audio, sr = sf.read(wav_path)
+            audio = audio.astype(np.float32)
+            
+            return audio, sr
+            
+        finally:
+            import os
+            try:
+                os.unlink(wav_path)
+            except:
+                pass
+    
+    @property
+    def available_engines(self):
+        return self._available_engines
+    
+    @property
+    def active_engine(self):
+        return self._active_engine
     
     def cleanup(self):
         """Cleanup resources"""
-        self._piper = None
         self._is_initialized = False

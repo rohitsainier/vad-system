@@ -49,7 +49,7 @@ Speak naturally as if having a conversation."""
     
     def __init__(
         self,
-        model: str = "llama3.1:8b",
+        model: str = "translategemma",
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 256,

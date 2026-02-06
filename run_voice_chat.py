@@ -13,7 +13,7 @@ def main():
     parser = argparse.ArgumentParser(description='Voice Chat with Local LLM')
     parser.add_argument('--host', default='0.0.0.0', help='Server host')
     parser.add_argument('--port', type=int, default=8080, help='Server port')
-    parser.add_argument('--llm', default='llama3.1:8b', help='Ollama model name')
+    parser.add_argument('--llm', default='translategemma', help='Ollama model name')
     parser.add_argument('--whisper', default='base', 
                        choices=['tiny', 'base', 'small', 'medium', 'large-v3'],
                        help='Whisper model size')
