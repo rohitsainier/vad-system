@@ -1,0 +1,646 @@
+<!-- src/voice_chat/web/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎤 Voice Chat</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0f0f23;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: #1a1a3e;
+            padding: 16px 20px;
+            text-align: center;
+            border-bottom: 2px solid #333;
+        }
+
+        .header h1 {
+            font-size: 22px;
+            color: #7aa2f7;
+        }
+
+        .header .status {
+            font-size: 13px;
+            margin-top: 4px;
+            color: #888;
+            transition: color 0.3s;
+        }
+
+        .header .status.connected {
+            color: #9ece6a;
+        }
+
+        .header .status.error {
+            color: #f7768e;
+        }
+
+        .header .status.loading {
+            color: #e0af68;
+        }
+
+        .chat-container {
+            flex: 1;
+            max-width: 800px;
+            margin: 0 auto;
+            width: 100%;
+            padding: 20px;
+            overflow-y: auto;
+            scroll-behavior: smooth;
+        }
+
+        .message {
+            margin: 8px 0;
+            padding: 10px 14px;
+            border-radius: 12px;
+            max-width: 80%;
+            animation: fadeIn 0.3s ease;
+            word-wrap: break-word;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .message.user {
+            background: #1a3a5c;
+            margin-left: auto;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message.assistant {
+            background: #1a3e2e;
+            margin-right: auto;
+            border-bottom-left-radius: 4px;
+        }
+
+        .message.system {
+            background: #2a2a4a;
+            text-align: center;
+            max-width: 100%;
+            font-size: 13px;
+            color: #aaa;
+        }
+
+        .message.error {
+            background: #3e1a1a;
+            text-align: center;
+            max-width: 100%;
+            font-size: 13px;
+            color: #f7768e;
+        }
+
+        .message .role {
+            font-size: 11px;
+            color: #888;
+            margin-bottom: 4px;
+            font-weight: 600;
+        }
+
+        .message .latency {
+            font-size: 11px;
+            color: #666;
+            margin-top: 6px;
+            font-style: italic;
+        }
+
+        .controls {
+            background: #1a1a3e;
+            padding: 16px 20px;
+            border-top: 2px solid #333;
+            text-align: center;
+        }
+
+        .mic-button {
+            width: 72px;
+            height: 72px;
+            border-radius: 50%;
+            border: 3px solid #444;
+            background: #2a2a4a;
+            color: white;
+            font-size: 28px;
+            cursor: pointer;
+            transition: all 0.2s;
+            outline: none;
+        }
+
+        .mic-button:hover:not(:disabled) {
+            background: #3a3a5a;
+            border-color: #7aa2f7;
+        }
+
+        .mic-button.active {
+            background: #c53b53;
+            border-color: #ff6b8a;
+            animation: pulse 1.5s infinite;
+        }
+
+        .mic-button:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                box-shadow: 0 0 0 0 rgba(197, 59, 83, 0.4);
+            }
+
+            50% {
+                box-shadow: 0 0 0 12px rgba(197, 59, 83, 0);
+            }
+        }
+
+        .vad-indicator {
+            height: 4px;
+            background: #333;
+            border-radius: 2px;
+            margin: 12px auto;
+            max-width: 300px;
+            overflow: hidden;
+        }
+
+        .vad-indicator .bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #9ece6a, #7aa2f7);
+            transition: width 0.1s;
+            border-radius: 2px;
+        }
+
+        .text-input {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .text-input input {
+            flex: 1;
+            padding: 10px 14px;
+            background: #2a2a4a;
+            border: 1px solid #444;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 14px;
+            outline: none;
+        }
+
+        .text-input input:focus {
+            border-color: #7aa2f7;
+        }
+
+        .text-input input:disabled {
+            opacity: 0.5;
+        }
+
+        .text-input button {
+            padding: 10px 20px;
+            background: #7aa2f7;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .text-input button:hover {
+            background: #5a8ad7;
+        }
+
+        .text-input button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .toolbar {
+            margin-top: 8px;
+            font-size: 12px;
+        }
+
+        .toolbar button {
+            background: none;
+            border: 1px solid #444;
+            color: #888;
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 4px;
+            font-size: 12px;
+        }
+
+        .toolbar button:hover {
+            color: #e0e0e0;
+            border-color: #666;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>🎤 Voice Chat with Local LLM</h1>
+        <div class="status" id="status">⏳ Connecting...</div>
+    </div>
+
+    <div class="chat-container" id="chat"></div>
+
+    <div class="controls">
+        <button class="mic-button" id="micBtn" disabled title="Click to start/stop recording">🎤</button>
+
+        <div class="vad-indicator">
+            <div class="bar" id="vadBar"></div>
+        </div>
+
+        <div class="text-input">
+            <input type="text" id="textInput" placeholder="Or type a message..." disabled />
+            <button id="sendBtn" onclick="sendText()" disabled>Send</button>
+        </div>
+
+        <div class="toolbar">
+            <button onclick="clearChat()">🗑️ Clear</button>
+            <button onclick="showStats()">📊 Stats</button>
+        </div>
+    </div>
+
+    <script>
+        // === Elements ===
+        const chatEl = document.getElementById('chat');
+        const micBtn = document.getElementById('micBtn');
+        const vadBar = document.getElementById('vadBar');
+        const statusEl = document.getElementById('status');
+        const textInput = document.getElementById('textInput');
+        const sendBtn = document.getElementById('sendBtn');
+
+        // === State ===
+        let ws = null;
+        let mediaStream = null;
+        let audioContext = null;
+        let processor = null;
+        let isListening = false;
+        let isReady = false;
+        let reconnectAttempts = 0;
+        let reconnectTimer = null;
+        const MAX_RECONNECT = 10;
+
+        // === WebSocket ===
+        function connect() {
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                return; // Already connected or connecting
+            }
+
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const url = `${protocol}//${location.host}/ws/chat`;
+
+            setStatus('⏳ Connecting...', 'loading');
+
+            try {
+                ws = new WebSocket(url);
+            } catch (e) {
+                setStatus('❌ Connection failed', 'error');
+                scheduleReconnect();
+                return;
+            }
+
+            ws.binaryType = 'arraybuffer';
+
+            ws.onopen = () => {
+                reconnectAttempts = 0;
+                setStatus('⏳ Connected, initializing...', 'loading');
+            };
+
+            ws.onclose = (event) => {
+                isReady = false;
+                enableControls(false);
+
+                if (isListening) {
+                    stopListening();
+                }
+
+                if (event.wasClean) {
+                    setStatus('🔴 Disconnected', '');
+                } else {
+                    setStatus('🔴 Connection lost', 'error');
+                }
+
+                scheduleReconnect();
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    // Binary audio response
+                    playAudioResponse(event.data);
+                } else {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        handleMessage(msg);
+                    } catch (e) {
+                        console.error('Parse error:', e);
+                    }
+                }
+            };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectTimer) return;
+
+            reconnectAttempts++;
+            if (reconnectAttempts > MAX_RECONNECT) {
+                setStatus('❌ Cannot connect. Refresh page to retry.', 'error');
+                return;
+            }
+
+            const delay = Math.min(2000 * reconnectAttempts, 10000);
+            setStatus(`🔄 Reconnecting in ${delay / 1000}s... (${reconnectAttempts}/${MAX_RECONNECT})`, 'loading');
+
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                connect();
+            }, delay);
+        }
+
+        function setStatus(text, className) {
+            statusEl.textContent = text;
+            statusEl.className = 'status ' + (className || '');
+        }
+
+        function enableControls(enabled) {
+            micBtn.disabled = !enabled;
+            textInput.disabled = !enabled;
+            sendBtn.disabled = !enabled;
+        }
+
+        // === Message Handling ===
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'ready':
+                    isReady = true;
+                    enableControls(true);
+                    setStatus('🟢 Ready - Click mic or type to chat', 'connected');
+                    addMessage('system', msg.message);
+                    break;
+
+                case 'status':
+                    setStatus('⏳ ' + msg.message, 'loading');
+                    addMessage('system', msg.message);
+                    break;
+
+                case 'vad':
+                    vadBar.style.width = `${(msg.probability || 0) * 100}%`;
+                    vadBar.style.background = msg.is_speech
+                        ? 'linear-gradient(90deg, #9ece6a, #7aa2f7)'
+                        : '#555';
+                    break;
+
+                case 'processing':
+                    addMessage('system', msg.message);
+                    setStatus('⏳ Processing...', 'loading');
+                    break;
+
+                case 'transcription':
+                    addMessage('user', msg.text);
+                    break;
+
+                case 'response':
+                    addMessage('assistant', msg.text, msg.latency);
+                    setStatus('🟢 Ready', 'connected');
+                    break;
+
+                case 'error':
+                    addMessage('error', '❌ ' + msg.message);
+                    setStatus('🟢 Ready', 'connected');
+                    break;
+
+                case 'cleared':
+                    chatEl.innerHTML = '';
+                    addMessage('system', '🗑️ Conversation cleared');
+                    break;
+
+                case 'stats':
+                    const d = msg.data;
+                    addMessage('system',
+                        `📊 Turns: ${d.turns} | ` +
+                        `Avg latency: ${(d.avg_latency_ms || 0).toFixed(0)}ms | ` +
+                        `STT: ${(d.avg_stt_ms || 0).toFixed(0)}ms | ` +
+                        `LLM: ${(d.avg_llm_ms || 0).toFixed(0)}ms | ` +
+                        `TTS: ${(d.avg_tts_ms || 0).toFixed(0)}ms`
+                    );
+                    break;
+
+                case 'ping':
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'pong' }));
+                    }
+                    break;
+            }
+        }
+
+        function addMessage(role, text, latency) {
+            const div = document.createElement('div');
+            div.className = `message ${role}`;
+
+            let roleLabel = '';
+            if (role === 'user') roleLabel = '🧑 You';
+            else if (role === 'assistant') roleLabel = '🤖 Assistant';
+            else roleLabel = '';
+
+            let html = '';
+            if (roleLabel) html += `<div class="role">${roleLabel}</div>`;
+            html += `<div>${escapeHtml(text)}</div>`;
+            if (latency) html += `<div class="latency">⚡ ${latency}</div>`;
+
+            div.innerHTML = html;
+            chatEl.appendChild(div);
+            chatEl.scrollTop = chatEl.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // === Microphone ===
+        async function toggleMic() {
+            if (isListening) {
+                stopListening();
+            } else {
+                await startListening();
+            }
+        }
+
+        async function startListening() {
+            if (!isReady || !ws || ws.readyState !== WebSocket.OPEN) {
+                addMessage('error', 'Not connected. Please wait for initialization.');
+                return;
+            }
+
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+
+                const source = audioContext.createMediaStreamSource(mediaStream);
+
+                // Use ScriptProcessor (widely supported)
+                processor = audioContext.createScriptProcessor(512, 1, 1);
+
+                processor.onaudioprocess = (e) => {
+                    if (!isListening || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+                    const float32 = e.inputBuffer.getChannelData(0);
+                    const int16 = new Int16Array(float32.length);
+
+                    for (let i = 0; i < float32.length; i++) {
+                        const s = Math.max(-1, Math.min(1, float32[i]));
+                        int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+
+                    ws.send(int16.buffer);
+                };
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                isListening = true;
+                micBtn.classList.add('active');
+                micBtn.textContent = '⏹';
+                setStatus('🔴 Listening... Speak now!', 'connected');
+
+            } catch (err) {
+                console.error('Mic error:', err);
+                addMessage('error', 'Microphone access denied: ' + err.message);
+            }
+        }
+
+        function stopListening() {
+            isListening = false;
+            micBtn.classList.remove('active');
+            micBtn.textContent = '🎤';
+
+            if (isReady) {
+                setStatus('🟢 Ready', 'connected');
+            }
+
+            if (processor) {
+                try { processor.disconnect(); } catch (e) { }
+            }
+            if (audioContext && audioContext.state !== 'closed') {
+                try { audioContext.close(); } catch (e) { }
+            }
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(t => t.stop());
+            }
+
+            processor = null;
+            audioContext = null;
+            mediaStream = null;
+        }
+
+        // === Audio Playback ===
+        function playAudioResponse(arrayBuffer) {
+            try {
+                const int16 = new Int16Array(arrayBuffer);
+
+                if (int16.length === 0) return;
+
+                const float32 = new Float32Array(int16.length);
+                for (let i = 0; i < int16.length; i++) {
+                    float32[i] = int16[i] / 32768.0;
+                }
+
+                const ctx = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+
+                const buffer = ctx.createBuffer(1, float32.length, 16000);
+                buffer.getChannelData(0).set(float32);
+
+                const source = ctx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(ctx.destination);
+                source.start();
+
+                source.onended = () => {
+                    ctx.close().catch(() => { });
+                };
+
+            } catch (err) {
+                console.error('Playback error:', err);
+            }
+        }
+
+        // === Text Chat ===
+        function sendText() {
+            const text = textInput.value.trim();
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN || !isReady) return;
+
+            addMessage('user', text);
+            ws.send(JSON.stringify({ type: 'text_chat', text: text }));
+            textInput.value = '';
+        }
+
+        // === Commands ===
+        function clearChat() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'clear' }));
+            }
+        }
+
+        function showStats() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'stats' }));
+            }
+        }
+
+        // === Event Listeners ===
+        micBtn.addEventListener('click', toggleMic);
+
+        textInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendText();
+        });
+
+        // === Start ===
+        connect();
+    </script>
+</body>
+
+</html>

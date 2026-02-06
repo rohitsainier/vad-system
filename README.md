@@ -26,18 +26,19 @@ A production-ready Voice Activity Detection (VAD) system with multiple backends,
 
 ### Option 1: Conda Environment (Recommended)
 
-#### Using environment.yml (Recommended)
 
 ```bash
 # Clone repository
-git clone https://github.com/example/vad-system.git
+git clone https://github.com/rohitsainier/vad-system.git
 cd vad-system
 
-# Create conda environment from file
-conda env create -f environment.yml
+conda create -y -n vad python=3.10
+conda activate vad
+pip install -r requirements.txt
 
-# Activate environment
-conda activate vad-system
+#Verify Installation
+python test_installation.py
 
-# Verify installation
-python -c "from src.core.vad_engine import VADEngine; print('Installation successful!')"
+#Test
+python test_file_vad.py
+
