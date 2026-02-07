@@ -1,7 +1,7 @@
 # src/voice_chat/chat_server.py
 """
 WebSocket server for voice-to-voice chat
-FIXED: Non-blocking initialization, proper error handling, Ollama auto-detect
+With barge-in (interrupt) support
 """
 import asyncio
 import json
@@ -42,6 +42,40 @@ async def index():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "voice-chat"}
+
+
+class SessionState:
+    """Per-session state tracking for barge-in support"""
+    
+    def __init__(self):
+        self.speech_buffer = []
+        self.is_speaking = False
+        self.silence_start = None
+        self.is_processing = False
+        self.is_playing_response = False
+        self.barge_in_triggered = False
+        self.processing_task: Optional[asyncio.Task] = None
+        
+        # Barge-in settings
+        self.barge_in_speech_frames = 0
+        self.barge_in_threshold = 3  # frames of speech to trigger interrupt
+        self.silence_timeout = 1.0  # seconds
+    
+    def reset_speech_buffer(self):
+        """Reset speech collection state"""
+        self.speech_buffer = []
+        self.is_speaking = False
+        self.silence_start = None
+        self.barge_in_speech_frames = 0
+    
+    def cancel_processing(self):
+        """Cancel any ongoing processing"""
+        if self.processing_task and not self.processing_task.done():
+            self.processing_task.cancel()
+            logger.info("Processing task cancelled due to barge-in")
+        self.is_processing = False
+        self.is_playing_response = False
+        self.barge_in_triggered = True
 
 
 @app.websocket("/ws/chat")
@@ -161,22 +195,17 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close()
         return
     
-    # === Main message loop ===
-    speech_buffer = []
-    is_speaking = False
-    silence_start = None
-    SILENCE_TIMEOUT = 1.0  # seconds of silence before processing
+    # === Main message loop with barge-in support ===
+    session = SessionState()
     
     try:
         while True:
             try:
-                # Receive with timeout to detect disconnects
                 message = await asyncio.wait_for(
                     websocket.receive(),
-                    timeout=60.0  # 60 second keepalive
+                    timeout=60.0
                 )
             except asyncio.TimeoutError:
-                # Send ping to keep connection alive
                 try:
                     await websocket.send_json({"type": "ping"})
                 except Exception:
@@ -200,90 +229,97 @@ async def websocket_chat(websocket: WebSocket):
                     logger.error("VAD error", error=str(e))
                     continue
                 
-                # Send VAD status
+                is_speech = bool(result.is_speech)
+                probability = float(result.raw_probability or 0)
+                
+                # Send VAD status to client (client uses this for barge-in too)
                 await websocket.send_json({
                     "type": "vad",
-                    "is_speech": bool(result.is_speech),
-                    "probability": float(result.raw_probability or 0)
+                    "is_speech": is_speech,
+                    "probability": probability
                 })
                 
-                if result.is_speech:
-                    speech_buffer.append(audio_float)
-                    is_speaking = True
-                    silence_start = None
+                # === Server-side barge-in detection ===
+                if is_speech and session.is_playing_response:
+                    session.barge_in_speech_frames += 1
+                    
+                    if session.barge_in_speech_frames >= session.barge_in_threshold:
+                        logger.info("Barge-in detected on server side")
+                        session.cancel_processing()
+                        session.reset_speech_buffer()
+                        
+                        await websocket.send_json({
+                            "type": "interrupted",
+                            "message": "Response interrupted by user"
+                        })
+                        
+                        # Start collecting new speech immediately
+                        session.speech_buffer.append(audio_float)
+                        session.is_speaking = True
+                        continue
+                
+                if not is_speech and not session.is_playing_response:
+                    session.barge_in_speech_frames = 0
+                
+                # === Normal speech collection ===
+                # Skip audio collection while playing response 
+                # (unless barge-in is triggered)
+                if session.is_processing:
+                    continue
+                
+                if is_speech:
+                    session.speech_buffer.append(audio_float)
+                    session.is_speaking = True
+                    session.silence_start = None
                 else:
-                    if is_speaking:
-                        if silence_start is None:
-                            silence_start = time.time()
+                    if session.is_speaking:
+                        if session.silence_start is None:
+                            session.silence_start = time.time()
                         
                         # Keep buffering during short silences
-                        speech_buffer.append(audio_float)
+                        session.speech_buffer.append(audio_float)
                         
                         # Check if silence timeout reached
-                        if time.time() - silence_start >= SILENCE_TIMEOUT:
+                        if time.time() - session.silence_start >= session.silence_timeout:
                             # Process accumulated speech
-                            if speech_buffer:
-                                full_audio = np.concatenate(speech_buffer)
+                            if session.speech_buffer:
+                                full_audio = np.concatenate(session.speech_buffer)
                                 duration_ms = len(full_audio) / 16000 * 1000
                                 
                                 if duration_ms >= 500:  # Minimum 500ms
-                                    await websocket.send_json({
-                                        "type": "processing",
-                                        "message": "⏳ Processing your speech..."
-                                    })
+                                    # Launch processing as a task so we can cancel it
+                                    session.is_processing = True
+                                    session.barge_in_triggered = False
                                     
-                                    # Process through pipeline (in executor to not block)
-                                    try:
-                                        tts_result = await loop.run_in_executor(
-                                            None,
-                                            pipeline.process_speech,
-                                            full_audio,
-                                            16000
+                                    session.processing_task = asyncio.create_task(
+                                        process_speech_turn(
+                                            websocket, pipeline, session,
+                                            full_audio, loop
                                         )
-                                        
-                                        if tts_result and pipeline.conversation.turns:
-                                            turn = pipeline.conversation.turns[-1]
-                                            
-                                            # Send transcription
-                                            await websocket.send_json({
-                                                "type": "transcription",
-                                                "text": turn.user_text
-                                            })
-                                            
-                                            # Send LLM response
-                                            await websocket.send_json({
-                                                "type": "response",
-                                                "text": turn.assistant_text,
-                                                "latency": turn.latency_summary
-                                            })
-                                            
-                                            # Send audio response
-                                            response_int16 = (tts_result.audio * 32767).clip(
-                                                -32768, 32767
-                                            ).astype(np.int16)
-                                            await websocket.send_bytes(response_int16.tobytes())
-                                        else:
-                                            await websocket.send_json({
-                                                "type": "status",
-                                                "message": "Could not process speech. Try again."
-                                            })
-                                    except Exception as e:
-                                        logger.error("Processing error", error=str(e))
-                                        await websocket.send_json({
-                                            "type": "error",
-                                            "message": f"Processing error: {str(e)[:100]}"
-                                        })
+                                    )
                             
-                            # Reset state
-                            speech_buffer = []
-                            is_speaking = False
-                            silence_start = None
+                            # Reset speech buffer
+                            session.reset_speech_buffer()
             
             elif "text" in message:
                 # JSON command
                 try:
                     cmd = json.loads(message["text"])
-                    await handle_command(cmd, websocket, pipeline, loop)
+                    
+                    if cmd.get("type") == "barge_in":
+                        # Client detected barge-in
+                        logger.info("Client reported barge-in")
+                        session.cancel_processing()
+                        session.reset_speech_buffer()
+                        
+                        await websocket.send_json({
+                            "type": "interrupted",
+                            "message": "Response interrupted"
+                        })
+                    else:
+                        await handle_command(
+                            cmd, websocket, pipeline, session, loop
+                        )
                 except json.JSONDecodeError:
                     pass
     
@@ -292,6 +328,9 @@ async def websocket_chat(websocket: WebSocket):
     except Exception as e:
         logger.error("WebSocket error", error=str(e))
     finally:
+        # Cancel any pending processing
+        session.cancel_processing()
+        
         if vad:
             vad.cleanup()
         if pipeline:
@@ -299,11 +338,125 @@ async def websocket_chat(websocket: WebSocket):
         logger.info("Session cleaned up", session_id=session_id)
 
 
-async def handle_command(cmd: dict, websocket: WebSocket, pipeline, loop):
+async def process_speech_turn(
+    websocket: WebSocket,
+    pipeline,
+    session: SessionState,
+    full_audio: np.ndarray,
+    loop
+):
+    """
+    Process a speech turn through the pipeline.
+    This runs as an asyncio task so it can be cancelled for barge-in.
+    """
+    try:
+        await websocket.send_json({
+            "type": "processing",
+            "message": "⏳ Processing your speech..."
+        })
+        
+        # Check if we were interrupted before even starting
+        if session.barge_in_triggered:
+            logger.info("Skipping processing - barge-in already triggered")
+            return
+        
+        # Process through pipeline (in executor to not block)
+        tts_result = await loop.run_in_executor(
+            None,
+            pipeline.process_speech,
+            full_audio,
+            16000
+        )
+        
+        # Check again after processing completes
+        if session.barge_in_triggered:
+            logger.info("Discarding result - barge-in during processing")
+            return
+        
+        if tts_result and pipeline.conversation.turns:
+            turn = pipeline.conversation.turns[-1]
+            
+            # Send transcription
+            await websocket.send_json({
+                "type": "transcription",
+                "text": turn.user_text
+            })
+            
+            # Check for barge-in before sending response
+            if session.barge_in_triggered:
+                logger.info("Discarding response - barge-in before delivery")
+                return
+            
+            # Send LLM response text
+            await websocket.send_json({
+                "type": "response",
+                "text": turn.assistant_text,
+                "latency": turn.latency_summary
+            })
+            
+            # Mark that we're about to play audio
+            session.is_playing_response = True
+            session.barge_in_speech_frames = 0
+            
+            # Check for barge-in before sending audio
+            if session.barge_in_triggered:
+                session.is_playing_response = False
+                return
+            
+            # Send audio response
+            response_int16 = (tts_result.audio * 32767).clip(
+                -32768, 32767
+            ).astype(np.int16)
+            await websocket.send_bytes(response_int16.tobytes())
+            
+            # Estimate playback duration and set a timer to clear playing state
+            # (Client also manages this, but this is a safety net)
+            playback_duration = len(tts_result.audio) / tts_result.sample_rate
+            
+            async def clear_playing_state():
+                await asyncio.sleep(playback_duration + 0.5)  # small buffer
+                if session.is_playing_response and not session.barge_in_triggered:
+                    session.is_playing_response = False
+                    session.barge_in_speech_frames = 0
+            
+            asyncio.create_task(clear_playing_state())
+            
+        else:
+            await websocket.send_json({
+                "type": "status",
+                "message": "Could not process speech. Try again."
+            })
+    
+    except asyncio.CancelledError:
+        logger.info("Processing cancelled (barge-in)")
+        session.is_playing_response = False
+    except Exception as e:
+        logger.error("Processing error", error=str(e))
+        session.is_playing_response = False
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "message": f"Processing error: {str(e)[:100]}"
+            })
+        except Exception:
+            pass
+    finally:
+        session.is_processing = False
+
+
+async def handle_command(
+    cmd: dict,
+    websocket: WebSocket,
+    pipeline,
+    session: SessionState,
+    loop
+):
     """Handle JSON commands from client"""
     cmd_type = cmd.get("type")
     
     if cmd_type == "clear":
+        session.cancel_processing()
+        session.reset_speech_buffer()
         if pipeline:
             pipeline.clear_history()
         await websocket.send_json({
@@ -314,6 +467,9 @@ async def handle_command(cmd: dict, websocket: WebSocket, pipeline, loop):
     elif cmd_type == "text_chat":
         text = cmd.get("text", "").strip()
         if text and pipeline and pipeline._is_initialized:
+            # Stop any playing response
+            session.cancel_processing()
+            
             await websocket.send_json({
                 "type": "processing",
                 "message": "⏳ Thinking..."
@@ -331,18 +487,32 @@ async def handle_command(cmd: dict, websocket: WebSocket, pipeline, loop):
                     "latency": f"LLM: {llm_response.processing_time_ms:.0f}ms"
                 })
                 
+                session.is_playing_response = True
+                session.barge_in_speech_frames = 0
+                
                 # TTS
                 tts_result = await loop.run_in_executor(
                     None, pipeline._tts_engine.synthesize, llm_response.text
                 )
                 
-                if tts_result:
+                if tts_result and not session.barge_in_triggered:
                     response_int16 = (tts_result.audio * 32767).clip(
                         -32768, 32767
                     ).astype(np.int16)
                     await websocket.send_bytes(response_int16.tobytes())
                     
+                    # Safety timer
+                    playback_duration = len(tts_result.audio) / tts_result.sample_rate
+                    
+                    async def clear_playing_state():
+                        await asyncio.sleep(playback_duration + 0.5)
+                        if session.is_playing_response and not session.barge_in_triggered:
+                            session.is_playing_response = False
+                    
+                    asyncio.create_task(clear_playing_state())
+                    
             except Exception as e:
+                session.is_playing_response = False
                 await websocket.send_json({
                     "type": "error",
                     "message": f"Error: {str(e)[:100]}"
@@ -356,8 +526,8 @@ async def handle_command(cmd: dict, websocket: WebSocket, pipeline, loop):
                 "data": summary
             })
     
-    elif cmd_type == "ping":
-        await websocket.send_json({"type": "pong"})
+    elif cmd_type == "pong":
+        pass  # Keepalive response, ignore
 
 
 def start_server(host: str = "0.0.0.0", port: int = 8080, config: dict = None):

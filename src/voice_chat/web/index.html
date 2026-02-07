@@ -53,6 +53,10 @@
             color: #e0af68;
         }
 
+        .header .status.speaking {
+            color: #bb9af7;
+        }
+
         .chat-container {
             flex: 1;
             max-width: 800px;
@@ -110,6 +114,11 @@
             max-width: 100%;
             font-size: 13px;
             color: #f7768e;
+        }
+
+        .message.interrupted {
+            opacity: 0.6;
+            border-left: 3px solid #f7768e;
         }
 
         .message .role {
@@ -307,10 +316,18 @@
         let reconnectTimer = null;
         const MAX_RECONNECT = 10;
 
+        // === Barge-in (interrupt) state ===
+        let isPlayingResponse = false;
+        let currentPlaybackSource = null;
+        let currentPlaybackContext = null;
+        let bargeInSpeechCount = 0;
+        const BARGE_IN_THRESHOLD = 3; // consecutive speech frames to trigger barge-in
+        let lastAssistantMessageEl = null;
+
         // === WebSocket ===
         function connect() {
             if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-                return; // Already connected or connecting
+                return;
             }
 
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -341,6 +358,8 @@
                     stopListening();
                 }
 
+                stopPlayback(); // Stop any playing audio
+
                 if (event.wasClean) {
                     setStatus('🔴 Disconnected', '');
                 } else {
@@ -356,7 +375,6 @@
 
             ws.onmessage = (event) => {
                 if (event.data instanceof ArrayBuffer) {
-                    // Binary audio response
                     playAudioResponse(event.data);
                 } else {
                     try {
@@ -398,6 +416,44 @@
             sendBtn.disabled = !enabled;
         }
 
+        // === Barge-in: Stop playback ===
+        function stopPlayback() {
+            if (currentPlaybackSource) {
+                try {
+                    currentPlaybackSource.stop();
+                } catch (e) { }
+                currentPlaybackSource = null;
+            }
+            if (currentPlaybackContext && currentPlaybackContext.state !== 'closed') {
+                try {
+                    currentPlaybackContext.close();
+                } catch (e) { }
+                currentPlaybackContext = null;
+            }
+
+            if (isPlayingResponse) {
+                isPlayingResponse = false;
+
+                // Mark the last assistant message as interrupted
+                if (lastAssistantMessageEl) {
+                    lastAssistantMessageEl.classList.add('interrupted');
+                    const interruptNote = document.createElement('div');
+                    interruptNote.className = 'latency';
+                    interruptNote.textContent = '⚡ Interrupted by user';
+                    lastAssistantMessageEl.appendChild(interruptNote);
+                }
+
+                // Notify server about the interruption
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'barge_in' }));
+                }
+
+                console.log('🔇 Playback stopped (barge-in)');
+            }
+
+            bargeInSpeechCount = 0;
+        }
+
         // === Message Handling ===
         function handleMessage(msg) {
             switch (msg.type) {
@@ -418,6 +474,22 @@
                     vadBar.style.background = msg.is_speech
                         ? 'linear-gradient(90deg, #9ece6a, #7aa2f7)'
                         : '#555';
+
+                    // === Barge-in detection ===
+                    if (msg.is_speech && isPlayingResponse) {
+                        bargeInSpeechCount++;
+                        if (bargeInSpeechCount >= BARGE_IN_THRESHOLD) {
+                            console.log('🎤 Barge-in detected! Stopping playback.');
+                            stopPlayback();
+                            addMessage('system', '🔇 Interrupted - listening to you...');
+                            setStatus('🔴 Listening... (interrupted response)', 'connected');
+                        }
+                    } else if (!msg.is_speech) {
+                        // Reset counter when no speech
+                        if (!isPlayingResponse) {
+                            bargeInSpeechCount = 0;
+                        }
+                    }
                     break;
 
                 case 'processing':
@@ -430,7 +502,13 @@
                     break;
 
                 case 'response':
-                    addMessage('assistant', msg.text, msg.latency);
+                    lastAssistantMessageEl = addMessage('assistant', msg.text, msg.latency);
+                    setStatus('🔊 Speaking...', 'speaking');
+                    break;
+
+                case 'interrupted':
+                    // Server acknowledged the interruption
+                    addMessage('system', '🔇 Response interrupted');
                     setStatus('🟢 Ready', 'connected');
                     break;
 
@@ -480,6 +558,8 @@
             div.innerHTML = html;
             chatEl.appendChild(div);
             chatEl.scrollTop = chatEl.scrollHeight;
+
+            return div; // Return element for later modification
         }
 
         function escapeHtml(text) {
@@ -520,7 +600,6 @@
 
                 const source = audioContext.createMediaStreamSource(mediaStream);
 
-                // Use ScriptProcessor (widely supported)
                 processor = audioContext.createScriptProcessor(512, 1, 1);
 
                 processor.onaudioprocess = (e) => {
@@ -556,7 +635,7 @@
             micBtn.classList.remove('active');
             micBtn.textContent = '🎤';
 
-            if (isReady) {
+            if (isReady && !isPlayingResponse) {
                 setStatus('🟢 Ready', 'connected');
             }
 
@@ -575,12 +654,15 @@
             mediaStream = null;
         }
 
-        // === Audio Playback ===
+        // === Audio Playback (with barge-in support) ===
         function playAudioResponse(arrayBuffer) {
             try {
                 const int16 = new Int16Array(arrayBuffer);
 
                 if (int16.length === 0) return;
+
+                // Stop any existing playback first
+                stopPlayback();
 
                 const float32 = new Float32Array(int16.length);
                 for (let i = 0; i < int16.length; i++) {
@@ -597,14 +679,37 @@
                 const source = ctx.createBufferSource();
                 source.buffer = buffer;
                 source.connect(ctx.destination);
-                source.start();
+
+                // Track playback state for barge-in
+                currentPlaybackContext = ctx;
+                currentPlaybackSource = source;
+                isPlayingResponse = true;
+                bargeInSpeechCount = 0;
 
                 source.onended = () => {
-                    ctx.close().catch(() => { });
+                    // Only update state if this is still the current playback
+                    // (not if it was interrupted)
+                    if (currentPlaybackSource === source) {
+                        isPlayingResponse = false;
+                        currentPlaybackSource = null;
+                        bargeInSpeechCount = 0;
+
+                        ctx.close().catch(() => { });
+                        currentPlaybackContext = null;
+
+                        if (isReady && isListening) {
+                            setStatus('🔴 Listening...', 'connected');
+                        } else if (isReady) {
+                            setStatus('🟢 Ready', 'connected');
+                        }
+                    }
                 };
+
+                source.start();
 
             } catch (err) {
                 console.error('Playback error:', err);
+                isPlayingResponse = false;
             }
         }
 
@@ -613,6 +718,9 @@
             const text = textInput.value.trim();
             if (!text || !ws || ws.readyState !== WebSocket.OPEN || !isReady) return;
 
+            // Stop any playing response when user sends text
+            stopPlayback();
+
             addMessage('user', text);
             ws.send(JSON.stringify({ type: 'text_chat', text: text }));
             textInput.value = '';
@@ -620,6 +728,7 @@
 
         // === Commands ===
         function clearChat() {
+            stopPlayback();
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'clear' }));
             }

@@ -48,3 +48,4 @@ edge-tts
 piper-tts 
 aiofiles 
 jinja2
+structlog
