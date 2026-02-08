@@ -39,7 +39,7 @@ async def main():
     )
     
     webhook_handler = WebhookHandler(
-        endpoints=["http://localhost:5000/webhook"],
+        endpoints=["http://localhost:8000/webhook"],
         max_retries=2
     )
     
@@ -90,7 +90,7 @@ async def main():
     print(f"  - VAD Engine: {settings.vad.backend.value}")
     print(f"  - Sample Rate: {settings.audio.sample_rate} Hz")
     print(f"  - Speech Handler: saving to ./speech_segments")
-    print(f"  - Webhook: http://localhost:5000/webhook")
+    print(f"  - Webhook: http://localhost:8000/webhook")
     print()
     print("Speak into your microphone. Press Ctrl+C to stop.")
     print()

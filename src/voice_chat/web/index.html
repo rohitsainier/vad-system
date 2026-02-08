@@ -321,8 +321,11 @@
         let currentPlaybackSource = null;
         let currentPlaybackContext = null;
         let bargeInSpeechCount = 0;
-        const BARGE_IN_THRESHOLD = 3; // consecutive speech frames to trigger barge-in
+        const BARGE_IN_THRESHOLD = 3;
         let lastAssistantMessageEl = null;
+
+        // ✅ TTS playback sample rate — updated by server messages
+        let ttsSampleRate = 24000;
 
         // === WebSocket ===
         function connect() {
@@ -358,7 +361,7 @@
                     stopListening();
                 }
 
-                stopPlayback(); // Stop any playing audio
+                stopPlayback();
 
                 if (event.wasClean) {
                     setStatus('🔴 Disconnected', '');
@@ -434,7 +437,6 @@
             if (isPlayingResponse) {
                 isPlayingResponse = false;
 
-                // Mark the last assistant message as interrupted
                 if (lastAssistantMessageEl) {
                     lastAssistantMessageEl.classList.add('interrupted');
                     const interruptNote = document.createElement('div');
@@ -443,7 +445,6 @@
                     lastAssistantMessageEl.appendChild(interruptNote);
                 }
 
-                // Notify server about the interruption
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'barge_in' }));
                 }
@@ -462,6 +463,11 @@
                     enableControls(true);
                     setStatus('🟢 Ready - Click mic or type to chat', 'connected');
                     addMessage('system', msg.message);
+                    // ✅ Capture TTS sample rate from server
+                    if (msg.tts_sample_rate) {
+                        ttsSampleRate = msg.tts_sample_rate;
+                        console.log(`🔊 TTS sample rate set to ${ttsSampleRate} Hz (from ready)`);
+                    }
                     break;
 
                 case 'status':
@@ -475,7 +481,6 @@
                         ? 'linear-gradient(90deg, #9ece6a, #7aa2f7)'
                         : '#555';
 
-                    // === Barge-in detection ===
                     if (msg.is_speech && isPlayingResponse) {
                         bargeInSpeechCount++;
                         if (bargeInSpeechCount >= BARGE_IN_THRESHOLD) {
@@ -485,7 +490,6 @@
                             setStatus('🔴 Listening... (interrupted response)', 'connected');
                         }
                     } else if (!msg.is_speech) {
-                        // Reset counter when no speech
                         if (!isPlayingResponse) {
                             bargeInSpeechCount = 0;
                         }
@@ -506,8 +510,16 @@
                     setStatus('🔊 Speaking...', 'speaking');
                     break;
 
+                // ✅ Capture per-utterance sample rate before audio bytes arrive
+                case 'audio_meta':
+                    ttsSampleRate = msg.sample_rate || 24000;
+                    console.log(
+                        `🔊 TTS audio: ${ttsSampleRate}Hz, ` +
+                        `${msg.duration_ms}ms, engine=${msg.engine}, seed=${msg.seed}`
+                    );
+                    break;
+
                 case 'interrupted':
-                    // Server acknowledged the interruption
                     addMessage('system', '🔇 Response interrupted');
                     setStatus('🟢 Ready', 'connected');
                     break;
@@ -559,7 +571,7 @@
             chatEl.appendChild(div);
             chatEl.scrollTop = chatEl.scrollHeight;
 
-            return div; // Return element for later modification
+            return div;
         }
 
         function escapeHtml(text) {
@@ -594,6 +606,7 @@
                     }
                 });
 
+                // Mic capture stays at 16000 — this is for VAD/STT, not playback
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: 16000
                 });
@@ -669,11 +682,15 @@
                     float32[i] = int16[i] / 32768.0;
                 }
 
+                // ✅ FIX: Use TTS sample rate (24000), NOT mic rate (16000)
+                const playbackRate = ttsSampleRate;
+                console.log(`▶️ Playing ${int16.length} samples at ${playbackRate}Hz (${(int16.length / playbackRate).toFixed(2)}s)`);
+
                 const ctx = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: 16000
+                    sampleRate: playbackRate
                 });
 
-                const buffer = ctx.createBuffer(1, float32.length, 16000);
+                const buffer = ctx.createBuffer(1, float32.length, playbackRate);
                 buffer.getChannelData(0).set(float32);
 
                 const source = ctx.createBufferSource();
@@ -687,8 +704,6 @@
                 bargeInSpeechCount = 0;
 
                 source.onended = () => {
-                    // Only update state if this is still the current playback
-                    // (not if it was interrupted)
                     if (currentPlaybackSource === source) {
                         isPlayingResponse = false;
                         currentPlaybackSource = null;
@@ -718,7 +733,6 @@
             const text = textInput.value.trim();
             if (!text || !ws || ws.readyState !== WebSocket.OPEN || !isReady) return;
 
-            // Stop any playing response when user sends text
             stopPlayback();
 
             addMessage('user', text);

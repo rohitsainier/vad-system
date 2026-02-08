@@ -1,14 +1,12 @@
 """
-TTS Engine - Text-to-Speech with multiple backends
+TTS Engine - Text-to-Speech via IndicF5 Voice Cloning API
 """
 import numpy as np
-import subprocess
-import tempfile
-import asyncio
+import base64
+import io
 import wave
-import struct
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List, Any
 from dataclasses import dataclass
 import structlog
 
@@ -18,310 +16,513 @@ logger = structlog.get_logger(__name__)
 @dataclass
 class TTSResult:
     """Result from TTS synthesis"""
-    audio: np.ndarray  # float32 audio
+    audio: np.ndarray
     sample_rate: int
     duration_ms: float
     engine_used: str
+    used_seed: Optional[int] = None
+    reference_voice_info: Optional[dict] = None
+
+
+@dataclass
+class ReferenceVoice:
+    """Reference voice metadata from IndicF5"""
+    key: str
+    author: str
+    content: str
+    file: str
+    sample_rate: int
+    model: str
+
+
+class IndicF5Client:
+    """
+    HTTP client for the IndicF5 TTS voice-cloning API.
+    """
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        timeout: int = 120,
+        default_reference_voice_key: str = "",
+        default_sample_rate: int = 24000,       # ✅ FIX: was 16000
+        default_output_format: str = "wav",
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.default_reference_voice_key = default_reference_voice_key
+        self.default_sample_rate = default_sample_rate
+        self.default_output_format = default_output_format
+
+        self._session = None
+        self._reference_voices_cache: Optional[Dict[str, ReferenceVoice]] = None
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _get_session(self):
+        if self._session is None:
+            import requests
+            self._session = requests.Session()
+            self._session.headers.update({"Content-Type": "application/json"})
+        return self._session
+
+    def _post_json(self, path: str, payload: dict) -> dict:
+        session = self._get_session()
+        url = f"{self.base_url}{path}"
+        logger.debug("indicf5_request", url=url, payload_keys=list(payload.keys()))
+        resp = session.post(url, json=payload, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _get_json(self, path: str) -> dict:
+        session = self._get_session()
+        url = f"{self.base_url}{path}"
+        resp = session.get(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _delete(self, path: str) -> dict:
+        session = self._get_session()
+        url = f"{self.base_url}{path}"
+        resp = session.delete(url, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    @staticmethod
+    def _b64_wav_to_numpy(audio_b64: str) -> Tuple[np.ndarray, int]:
+        """Decode base64 WAV to numpy, reading the ACTUAL sample rate from
+        the WAV header so we never guess wrong."""
+        wav_bytes = base64.b64decode(audio_b64)
+        with io.BytesIO(wav_bytes) as buf:
+            with wave.open(buf, "rb") as wf:
+                n_channels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                sr = wf.getframerate()
+                n_frames = wf.getnframes()
+                raw = wf.readframes(n_frames)
+
+        if sampwidth == 2:
+            dtype, max_val = np.int16, 32768.0
+        elif sampwidth == 4:
+            dtype, max_val = np.int32, 2147483648.0
+        else:
+            raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+        audio = np.frombuffer(raw, dtype=dtype).astype(np.float32) / max_val
+        if n_channels > 1:
+            audio = audio.reshape(-1, n_channels).mean(axis=1)
+
+        logger.debug(
+            "wav_decoded",
+            sample_rate=sr,
+            samples=len(audio),
+            duration_s=round(len(audio) / sr, 3),
+        )
+        return audio, sr
+
+    # ------------------------------------------------------------------ #
+    #  Health
+    # ------------------------------------------------------------------ #
+
+    def health_check(self) -> bool:
+        try:
+            self._get_json("/api/health")
+            return True
+        except Exception as exc:
+            logger.debug("indicf5_health_fail", error=str(exc))
+            return False
+
+    # ------------------------------------------------------------------ #
+    #  Reference voices
+    # ------------------------------------------------------------------ #
+
+    def list_reference_voices(self, force_refresh: bool = False) -> Dict[str, ReferenceVoice]:
+        if self._reference_voices_cache is not None and not force_refresh:
+            return self._reference_voices_cache
+
+        data = self._get_json("/api/referenceVoices")
+        voices: Dict[str, ReferenceVoice] = {}
+        for key, info in data.get("reference_voices", {}).items():
+            voices[key] = ReferenceVoice(
+                key=key,
+                author=info.get("author", ""),
+                content=info.get("content", ""),
+                file=info.get("file", ""),
+                sample_rate=info.get("sample_rate", 24000),   # ✅ FIX
+                model=info.get("model", "F5TTS"),
+            )
+        self._reference_voices_cache = voices
+        return voices
+
+    def upload_reference_voice(
+        self,
+        filepath: str,
+        name: str,
+        author: str,
+        content: str = "",
+        model: str = "F5TTS",
+    ) -> dict:
+        session = self._get_session()
+        url = f"{self.base_url}/api/referenceVoices/upload"
+        with open(filepath, "rb") as f:
+            files = {"file": (Path(filepath).name, f)}
+            form = {"name": name, "author": author, "content": content, "model": model}
+            resp = session.post(url, files=files, data=form,
+                                timeout=self.timeout, headers={})
+        resp.raise_for_status()
+        self._reference_voices_cache = None
+        return resp.json()
+
+    def delete_reference_voice(self, voice_key: str) -> dict:
+        result = self._delete(f"/api/referenceVoices/{voice_key}")
+        self._reference_voices_cache = None
+        return result
+
+    def get_reference_voice_audio_url(self, voice_key: str) -> str:
+        return f"{self.base_url}/api/referenceVoices/{voice_key}/audio"
+
+    # ------------------------------------------------------------------ #
+    #  Single TTS
+    # ------------------------------------------------------------------ #
+
+    def synthesize(
+        self,
+        text: str,
+        reference_voice_key: Optional[str] = None,
+        output_format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        normalize: bool = True,
+        seed: int = -1,
+        save_to_file: bool = False,
+    ) -> dict:
+        payload = {
+            "text": text,
+            "reference_voice_key": reference_voice_key or self.default_reference_voice_key,
+            "output_format": output_format or self.default_output_format,
+            "sample_rate": sample_rate or self.default_sample_rate,
+            "normalize": normalize,
+            "seed": seed,
+            "save_to_file": save_to_file,
+        }
+        return self._post_json("/api/tts", payload)
+
+    def synthesize_to_numpy(
+        self,
+        text: str,
+        reference_voice_key: Optional[str] = None,
+        output_format: str = "wav",
+        sample_rate: Optional[int] = None,
+        normalize: bool = True,
+        seed: int = -1,
+    ) -> Tuple[np.ndarray, int, dict]:
+        resp = self.synthesize(
+            text=text,
+            reference_voice_key=reference_voice_key,
+            output_format=output_format,
+            sample_rate=sample_rate,
+            normalize=normalize,
+            seed=seed,
+            save_to_file=False,
+        )
+        if not resp.get("success"):
+            raise RuntimeError(
+                f"IndicF5 synthesis failed: {resp.get('message', 'unknown error')}"
+            )
+        audio, sr = self._b64_wav_to_numpy(resp["audio_base64"])
+        return audio, sr, resp
+
+    # ------------------------------------------------------------------ #
+    #  Batch TTS
+    # ------------------------------------------------------------------ #
+
+    def synthesize_batch(
+        self,
+        requests_list: List[Dict[str, Any]],
+        return_as_zip: bool = False,
+    ) -> dict:
+        payload = {
+            "requests": requests_list,
+            "return_as_zip": return_as_zip,
+        }
+        return self._post_json("/api/tts/batch", payload)
+
+    # ------------------------------------------------------------------ #
+    #  Prompt-tagged TTS
+    # ------------------------------------------------------------------ #
+
+    def synthesize_prompt_tagged(
+        self,
+        text: str,
+        base_reference_voice_key: Optional[str] = None,
+        output_format: str = "wav",
+        sample_rate: Optional[int] = None,
+        normalize: bool = True,
+        max_chunk_chars: int = 300,
+        pause_duration: int = 200,
+    ) -> dict:
+        payload = {
+            "text": text,
+            "base_reference_voice_key": base_reference_voice_key
+            or self.default_reference_voice_key,
+            "output_format": output_format,
+            "sample_rate": sample_rate or self.default_sample_rate,
+            "normalize": normalize,
+            "max_chunk_chars": max_chunk_chars,
+            "pause_duration": pause_duration,
+        }
+        return self._post_json("/api/tts/prompt-tagged", payload)
+
+    # ------------------------------------------------------------------ #
+    #  Podcast
+    # ------------------------------------------------------------------ #
+
+    def generate_podcast(
+        self,
+        title: str,
+        speakers: List[Dict[str, str]],
+        segments: List[Dict[str, Any]],
+        pause_duration: int = 500,
+        output_format: str = "wav",
+        sample_rate: Optional[int] = None,
+        normalize: bool = True,
+        seed: int = -1,
+    ) -> dict:
+        payload = {
+            "title": title,
+            "speakers": speakers,
+            "segments": segments,
+            "pause_duration": pause_duration,
+            "output_format": output_format,
+            "sample_rate": sample_rate or self.default_sample_rate,
+            "normalize": normalize,
+            "seed": seed,
+        }
+        return self._post_json("/api/podcast/generate", payload)
+
+    # ------------------------------------------------------------------ #
+    #  File management
+    # ------------------------------------------------------------------ #
+
+    def list_files(self) -> dict:
+        return self._get_json("/api/files")
+
+    def download_file_url(self, filename: str) -> str:
+        return f"{self.base_url}/api/files/{filename}"
+
+    def delete_file(self, filename: str) -> dict:
+        return self._delete(f"/api/files/{filename}")
+
+    def clear_all_files(self) -> dict:
+        return self._delete("/api/files")
+
+    # ------------------------------------------------------------------ #
+    #  System
+    # ------------------------------------------------------------------ #
+
+    def system_monitor(self) -> dict:
+        return self._get_json("/api/system/monitor")
+
+    # ------------------------------------------------------------------ #
+    #  Cleanup
+    # ------------------------------------------------------------------ #
+
+    def close(self):
+        if self._session is not None:
+            self._session.close()
+            self._session = None
 
 
 class TTSEngine:
     """
-    Text-to-Speech engine with multiple backends
-    
-    Backends:
-    - piper: Fast, local neural TTS
-    - edge-tts: Microsoft Edge TTS (online)
-    - espeak: Basic fallback
+    Text-to-Speech engine powered by the IndicF5 voice-cloning API.
     """
-    
-    PIPER_SAMPLE_RATE = 22050  # Piper default output rate
-    
+
     def __init__(
         self,
-        engine: str = "auto",
-        piper_model: Optional[str] = None,
-        edge_voice: str = "en-US-AriaNeural",
-        espeak_voice: str = "en"
+        indicf5_base_url: str = "http://localhost:8000",
+        indicf5_reference_voice_key: str = "",
+        indicf5_sample_rate: int = 24000,       # ✅ FIX: was 16000
+        indicf5_output_format: str = "wav",
+        indicf5_timeout: int = 120,
+        indicf5_seed: int = -1,
+        indicf5_normalize: bool = True,
     ):
-        self.preferred_engine = engine
-        self.piper_model = piper_model
-        self.edge_voice = edge_voice
-        self.espeak_voice = espeak_voice
-        
-        self._available_engines = []
-        self._active_engine = None
+        self.indicf5_client = IndicF5Client(
+            base_url=indicf5_base_url,
+            timeout=indicf5_timeout,
+            default_reference_voice_key=indicf5_reference_voice_key,
+            default_sample_rate=indicf5_sample_rate,
+            default_output_format=indicf5_output_format,
+        )
+        self._indicf5_reference_voice_key = indicf5_reference_voice_key
+        self._indicf5_sample_rate = indicf5_sample_rate
+        self._indicf5_seed = indicf5_seed
+        self._indicf5_normalize = indicf5_normalize
         self._is_initialized = False
-    
+
+    # ================================================================== #
+    #  Initialization
+    # ================================================================== #
+
     def initialize(self):
-        """Initialize and detect available TTS engines"""
+        """Verify the IndicF5 server is reachable."""
         if self._is_initialized:
             return
-        
-        # Check available engines
-        self._available_engines = []
-        
-        # Check Piper
-        if self._check_piper():
-            self._available_engines.append("piper")
-            logger.info("Piper TTS available")
-        
-        # Check edge-tts
-        if self._check_edge_tts():
-            self._available_engines.append("edge-tts")
-            logger.info("Edge TTS available")
-        
-        # Check espeak
-        if self._check_espeak():
-            self._available_engines.append("espeak")
-            logger.info("eSpeak available")
-        
-        if not self._available_engines:
-            raise RuntimeError("No TTS engines available! Install piper, edge-tts, or espeak.")
-        
-        # Select engine
-        if self.preferred_engine == "auto":
-            self._active_engine = self._available_engines[0]
-        elif self.preferred_engine in self._available_engines:
-            self._active_engine = self.preferred_engine
-        else:
-            logger.warning(f"{self.preferred_engine} not available, using {self._available_engines[0]}")
-            self._active_engine = self._available_engines[0]
-        
-        logger.info(f"Using TTS engine: {self._active_engine}")
+
+        if not self.indicf5_client.health_check():
+            raise RuntimeError(
+                f"IndicF5 server not reachable at {self.indicf5_client.base_url}. "
+                "Make sure the server is running."
+            )
+
+        logger.info(
+            "indicf5_ready",
+            url=self.indicf5_client.base_url,
+            voice=self._indicf5_reference_voice_key or "(auto)",
+            sample_rate=self._indicf5_sample_rate,
+        )
         self._is_initialized = True
-    
-    def _check_piper(self) -> bool:
-        """Check if Piper is available"""
-        try:
-            result = subprocess.run(
-                ["piper", "--help"],
-                capture_output=True,
-                timeout=5
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-    
-    def _check_edge_tts(self) -> bool:
-        """Check if edge-tts is available"""
-        try:
-            import edge_tts
-            return True
-        except ImportError:
-            return False
-    
-    def _check_espeak(self) -> bool:
-        """Check if espeak is available"""
-        try:
-            result = subprocess.run(
-                ["espeak", "--version"],
-                capture_output=True,
-                timeout=5
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            # Try espeak-ng
-            try:
-                result = subprocess.run(
-                    ["espeak-ng", "--version"],
-                    capture_output=True,
-                    timeout=5
-                )
-                return result.returncode == 0
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                return False
-    
-    def synthesize(self, text: str) -> TTSResult:
+
+    # ================================================================== #
+    #  Core synthesis
+    # ================================================================== #
+
+    def synthesize(
+        self,
+        text: str,
+        reference_voice_key: Optional[str] = None,
+        seed: Optional[int] = None,
+    ) -> TTSResult:
         """
-        Synthesize text to speech
-        
+        Synthesize text to speech using IndicF5 voice cloning.
+
         Args:
-            text: Text to speak
-            
+            text:                Text to convert.
+            reference_voice_key: Override the default reference voice.
+            seed:                Override the default seed (-1 = random).
+
         Returns:
-            TTSResult with audio
+            TTSResult with float32 audio numpy array.
         """
         if not self._is_initialized:
             self.initialize()
-        
+
         if not text.strip():
-            # Return silence for empty text
+            sr = self._indicf5_sample_rate
+            silence_samples = int(sr * 0.1)  # 100ms of silence
             return TTSResult(
-                audio=np.zeros(1600, dtype=np.float32),
-                sample_rate=16000,
-                duration_ms=100,
-                engine_used="none"
+                audio=np.zeros(silence_samples, dtype=np.float32),
+                sample_rate=sr,
+                duration_ms=100.0,
+                engine_used="F5TTS",
             )
-        
-        # Try active engine, fall back if needed
-        engines_to_try = [self._active_engine] + [
-            e for e in self._available_engines if e != self._active_engine
-        ]
-        
-        for engine in engines_to_try:
-            try:
-                if engine == "piper":
-                    audio, sr = self._synthesize_piper(text)
-                elif engine == "edge-tts":
-                    audio, sr = self._synthesize_edge_tts(text)
-                elif engine == "espeak":
-                    audio, sr = self._synthesize_espeak(text)
-                else:
-                    continue
-                
-                duration_ms = len(audio) / sr * 1000
-                
-                return TTSResult(
-                    audio=audio,
-                    sample_rate=sr,
-                    duration_ms=duration_ms,
-                    engine_used=engine
-                )
-                
-            except Exception as e:
-                logger.warning(f"{engine} failed: {e}, trying next...")
-                continue
-        
-        raise RuntimeError("All TTS engines failed")
-    
-    def _synthesize_piper(self, text: str) -> Tuple[np.ndarray, int]:
-        """Synthesize using Piper TTS"""
-        
-        # Piper outputs raw 16-bit PCM audio to stdout
-        cmd = ["piper", "--output_raw"]
-        
-        if self.piper_model:
-            cmd.extend(["--model", self.piper_model])
-        
-        # Run piper with text input
-        process = subprocess.run(
-            cmd,
-            input=text.encode('utf-8'),
-            capture_output=True,
-            timeout=30
+
+        voice_key = (
+            reference_voice_key
+            or self._indicf5_reference_voice_key
+            or self.indicf5_client.default_reference_voice_key
         )
-        
-        if process.returncode != 0:
-            stderr = process.stderr.decode('utf-8', errors='ignore')
-            raise RuntimeError(f"Piper failed: {stderr}")
-        
-        # Raw output is 16-bit signed PCM at 22050 Hz (Piper default)
-        raw_audio = process.stdout
-        
-        if len(raw_audio) < 2:
-            raise RuntimeError("Piper returned empty audio")
-        
-        # Convert raw bytes to numpy array
-        # Piper outputs 16-bit signed little-endian PCM
-        audio_int16 = np.frombuffer(raw_audio, dtype=np.int16)
-        
-        # Convert to float32 normalized [-1, 1]
-        audio = audio_int16.astype(np.float32) / 32768.0
-        
-        return audio, self.PIPER_SAMPLE_RATE
-    
-    def _synthesize_edge_tts(self, text: str) -> Tuple[np.ndarray, int]:
-        """Synthesize using Edge TTS"""
-        import edge_tts
-        import io
-        
-        # Run async edge-tts
-        async def _generate():
-            communicate = edge_tts.Communicate(text, self.edge_voice)
-            audio_data = b""
-            
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_data += chunk["data"]
-            
-            return audio_data
-        
-        # Run in event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        mp3_data = loop.run_until_complete(_generate())
-        
-        # Convert MP3 to WAV using ffmpeg
-        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as mp3_file:
-            mp3_file.write(mp3_data)
-            mp3_path = mp3_file.name
-        
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as wav_file:
-            wav_path = wav_file.name
-        
-        try:
-            # Convert MP3 to WAV
-            subprocess.run([
-                "ffmpeg", "-y", "-i", mp3_path,
-                "-ar", "22050", "-ac", "1", "-f", "wav",
-                wav_path
-            ], capture_output=True, timeout=30, check=True)
-            
-            # Read WAV file
-            import soundfile as sf
-            audio, sr = sf.read(wav_path)
-            audio = audio.astype(np.float32)
-            
-            return audio, sr
-            
-        finally:
-            # Cleanup temp files
-            import os
-            try:
-                os.unlink(mp3_path)
-                os.unlink(wav_path)
-            except:
-                pass
-    
-    def _synthesize_espeak(self, text: str) -> Tuple[np.ndarray, int]:
-        """Synthesize using espeak/espeak-ng"""
-        
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-            wav_path = f.name
-        
-        try:
-            # Try espeak-ng first, then espeak
-            for cmd in ["espeak-ng", "espeak"]:
-                try:
-                    result = subprocess.run([
-                        cmd, "-v", self.espeak_voice,
-                        "-w", wav_path,
-                        text
-                    ], capture_output=True, timeout=30)
-                    
-                    if result.returncode == 0:
-                        break
-                except FileNotFoundError:
-                    continue
-            else:
-                raise RuntimeError("espeak not found")
-            
-            # Read WAV file
-            import soundfile as sf
-            audio, sr = sf.read(wav_path)
-            audio = audio.astype(np.float32)
-            
-            return audio, sr
-            
-        finally:
-            import os
-            try:
-                os.unlink(wav_path)
-            except:
-                pass
-    
+
+        # Auto-pick first available voice if none configured
+        if not voice_key:
+            voices = self.indicf5_client.list_reference_voices()
+            if not voices:
+                raise RuntimeError(
+                    "No reference voices on the IndicF5 server. "
+                    "Upload one with upload_reference_voice()."
+                )
+            voice_key = next(iter(voices))
+            logger.info("indicf5_auto_voice", voice_key=voice_key)
+
+        audio, actual_sr, meta = self.indicf5_client.synthesize_to_numpy(
+            text=text,
+            reference_voice_key=voice_key,
+            output_format="wav",
+            sample_rate=self._indicf5_sample_rate,
+            normalize=self._indicf5_normalize,
+            seed=seed if seed is not None else self._indicf5_seed,
+        )
+
+        # ✅ Warn if the server returned a different rate than requested
+        if actual_sr != self._indicf5_sample_rate:
+            logger.warning(
+                "indicf5_sample_rate_mismatch",
+                requested=self._indicf5_sample_rate,
+                actual=actual_sr,
+            )
+
+        # ✅ Always use the ACTUAL sample rate from the WAV header
+        return TTSResult(
+            audio=audio,
+            sample_rate=actual_sr,
+            duration_ms=len(audio) / actual_sr * 1000,
+            engine_used="F5TTS",
+            used_seed=meta.get("used_seed"),
+            reference_voice_info=meta.get("reference_voice_info"),
+        )
+
+    # ================================================================== #
+    #  Reference voice management
+    # ================================================================== #
+
+    def list_reference_voices(self, force_refresh: bool = False) -> Dict[str, ReferenceVoice]:
+        return self.indicf5_client.list_reference_voices(force_refresh=force_refresh)
+
+    def upload_reference_voice(
+        self,
+        filepath: str,
+        name: str,
+        author: str,
+        content: str = "",
+        model: str = "F5TTS",
+    ) -> dict:
+        return self.indicf5_client.upload_reference_voice(
+            filepath=filepath, name=name, author=author,
+            content=content, model=model,
+        )
+
+    def delete_reference_voice(self, voice_key: str) -> dict:
+        return self.indicf5_client.delete_reference_voice(voice_key)
+
+    def set_reference_voice(self, voice_key: str):
+        """Change the default reference voice at runtime."""
+        self._indicf5_reference_voice_key = voice_key
+        self.indicf5_client.default_reference_voice_key = voice_key
+        logger.info("indicf5_voice_changed", voice_key=voice_key)
+
+    # ================================================================== #
+    #  Prompt-tagged & batch synthesis
+    # ================================================================== #
+
+    def synthesize_prompt_tagged(self, text: str, **kwargs) -> dict:
+        """Synthesize text containing <refvoice key='...'>...</refvoice> tags."""
+        return self.indicf5_client.synthesize_prompt_tagged(text, **kwargs)
+
+    def synthesize_batch(self, requests_list: List[Dict[str, Any]], **kwargs) -> dict:
+        """Batch-synthesize multiple texts."""
+        return self.indicf5_client.synthesize_batch(requests_list, **kwargs)
+
+    # ================================================================== #
+    #  Podcast
+    # ================================================================== #
+
+    def generate_podcast(self, **kwargs) -> dict:
+        return self.indicf5_client.generate_podcast(**kwargs)
+
+    # ================================================================== #
+    #  Properties & cleanup
+    # ================================================================== #
+
     @property
-    def available_engines(self):
-        return self._available_engines
-    
+    def available_engines(self) -> List[str]:
+        return ["F5TTS"]
+
     @property
-    def active_engine(self):
-        return self._active_engine
-    
+    def active_engine(self) -> str:
+        return "F5TTS"
+
     def cleanup(self):
-        """Cleanup resources"""
+        self.indicf5_client.close()
         self._is_initialized = False
